@@ -3,7 +3,8 @@
 use kora_shared::{
     errors::KoraError,
     events,
-    validation::require_valid_fee_bps,
+    reentrancy::ReentrancyGuard,
+    validation::{require_non_zero_amount, require_valid_fee_bps},
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
@@ -23,6 +24,8 @@ pub enum DataKey {
     Collected(Address),
     /// Reentrancy guard for withdrawal functions.
     WithdrawalLock,
+    /// Whitelisted tokens.
+    WhitelistedToken(Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -132,25 +135,19 @@ impl TreasuryContract {
             return Err(KoraError::InvalidAmount);
         }
 
-        Self::acquire_lock(&env)?;
+        let _guard = ReentrancyGuard::new(&env)?;
 
         let token_client = token::Client::new(&env, &token);
         let balance = token_client.balance(&env.current_contract_address());
 
         if balance < amount {
-            // Release lock before returning error — must not leave lock stuck
-            Self::release_lock(&env);
             return Err(KoraError::InsufficientPoolBalance);
         }
 
         // ── Effects ───────────────────────────────────────────────────────────
         // Deduct from informational accounting if tracked
         let collected_key = DataKey::Collected(token.clone());
-        if let Some(collected) = env
-            .storage()
-            .persistent()
-            .get::<_, i128>(&collected_key)
-        {
+        if let Some(collected) = env.storage().persistent().get::<_, i128>(&collected_key) {
             // Saturating sub: accounting is informational, don't revert on mismatch
             let new_collected = collected.saturating_sub(amount);
             env.storage()
@@ -186,20 +183,11 @@ impl TreasuryContract {
         let balance = token_client.balance(&env.current_contract_address());
 
         if balance > 0 {
+            // ── Interactions ──────────────────────────────────────────────────────
             token_client.transfer(&env.current_contract_address(), &recipient, &balance);
-        }
-
-        // Always release lock regardless of whether a transfer occurred
-        Self::release_lock(&env);
-
-        if balance > 0 {
             events::emergency_withdrawn(&env, &admin, &token, balance);
         }
 
-        // ── Interactions ──────────────────────────────────────────────────────
-        token_client.transfer(&env.current_contract_address(), &recipient, &balance);
-
-        events::emergency_withdrawn(&env, &admin, &token, balance);
         Ok(())
     }
 
@@ -249,8 +237,12 @@ impl TreasuryContract {
         Ok(())
     }
 
-    fn release_lock(env: &Env) {
-        env.storage().instance().set(&DataKey::WithdrawalLock, &false);
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 }
 
@@ -267,7 +259,7 @@ mod tests {
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin, &50u32).unwrap();
+        client.initialize(&admin, &50u32);
         (env, admin, client)
     }
 
@@ -310,7 +302,7 @@ mod tests {
     #[test]
     fn test_set_fee_bps_success() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &100u32).unwrap();
+        client.set_fee_bps(&admin, &100u32);
         assert_eq!(client.get_fee_bps(), 100);
     }
 
@@ -330,14 +322,14 @@ mod tests {
     #[test]
     fn test_set_fee_bps_zero_allowed() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &0u32).unwrap();
+        client.set_fee_bps(&admin, &0u32);
         assert_eq!(client.get_fee_bps(), 0);
     }
 
     #[test]
     fn test_set_fee_bps_max_allowed() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &10_000u32).unwrap();
+        client.set_fee_bps(&admin, &10_000u32);
         assert_eq!(client.get_fee_bps(), 10_000);
     }
 
@@ -350,11 +342,11 @@ mod tests {
     #[test]
     fn test_set_fee_bps_multiple_updates() {
         let (_env, admin, client) = setup();
-        client.set_fee_bps(&admin, &100u32).unwrap();
+        client.set_fee_bps(&admin, &100u32);
         assert_eq!(client.get_fee_bps(), 100);
-        client.set_fee_bps(&admin, &200u32).unwrap();
+        client.set_fee_bps(&admin, &200u32);
         assert_eq!(client.get_fee_bps(), 200);
-        client.set_fee_bps(&admin, &50u32).unwrap();
+        client.set_fee_bps(&admin, &50u32);
         assert_eq!(client.get_fee_bps(), 50);
     }
 
@@ -366,7 +358,9 @@ mod tests {
         let non_admin = Address::generate(&env);
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_withdraw(&non_admin, &token, &recipient, &1_000_000i128).is_err());
+        assert!(client
+            .try_withdraw(&non_admin, &token, &recipient, &1_000_000i128)
+            .is_err());
     }
 
     #[test]
@@ -374,7 +368,9 @@ mod tests {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_withdraw(&admin, &token, &recipient, &0i128).is_err());
+        assert!(client
+            .try_withdraw(&admin, &token, &recipient, &0i128)
+            .is_err());
     }
 
     #[test]
@@ -382,7 +378,9 @@ mod tests {
         let (env, admin, client) = setup();
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_withdraw(&admin, &token, &recipient, &-1_000i128).is_err());
+        assert!(client
+            .try_withdraw(&admin, &token, &recipient, &-1_000i128)
+            .is_err());
     }
 
     #[test]
@@ -391,7 +389,9 @@ mod tests {
         let non_admin = Address::generate(&env);
         let token = Address::generate(&env);
         let recipient = Address::generate(&env);
-        assert!(client.try_emergency_withdraw(&non_admin, &token, &recipient).is_err());
+        assert!(client
+            .try_emergency_withdraw(&non_admin, &token, &recipient)
+            .is_err());
     }
 
     #[test]
